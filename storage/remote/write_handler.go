@@ -199,9 +199,8 @@ func (h *writeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respStats, errHTTPCode, err := h.writeV2(r.Context(), &req)
-
 	// Set required X-Prometheus-Remote-Write-Accepted-* response headers, in all cases.
-	respStats.SetResponseHeaders(w.Header())
+	respStats.SetHeaders(w)
 
 	if err != nil {
 		if errHTTPCode/5 == 100 { // 5xx
@@ -324,16 +323,65 @@ const (
 	rw20AcceptedExemplarsHeader  = "X-Prometheus-Remote-Write-Accepted-Exemplars"
 )
 
-type responseStats struct {
-	samples    int
-	histograms int
-	exemplars  int
+// ResponseStats represents response statistics specified in https://github.com/prometheus/docs/pull/2486
+type ResponseStats struct {
+	// AcceptedSamples represents X-Prometheus-Remote-Write-Accepted-Samples
+	AcceptedSamples int
+	// AcceptedHistograms represents X-Prometheus-Remote-Write-Accepted-Histograms
+	AcceptedHistograms int
+	// AcceptedExemplars represents X-Prometheus-Remote-Write-Accepted-Exemplars
+	AcceptedExemplars int
 }
 
-func (s responseStats) SetResponseHeaders(h http.Header) {
-	h.Set(prw20AcceptedSamplesHeader, strconv.Itoa(s.samples))
-	h.Set(rw20AcceptedHistogramsHeader, strconv.Itoa(s.histograms))
-	h.Set(rw20AcceptedExemplarsHeader, strconv.Itoa(s.exemplars))
+// AllAcceptedSamples returns both float and histogram sample numbers.
+func (s ResponseStats) AllAcceptedSamples() int {
+	return s.AcceptedSamples + s.AcceptedHistograms
+}
+
+func (s ResponseStats) Add(rs ResponseStats) ResponseStats {
+	s.AcceptedSamples += rs.AcceptedSamples
+	s.AcceptedHistograms += rs.AcceptedHistograms
+	s.AcceptedExemplars += rs.AcceptedExemplars
+	return s
+}
+
+// SetHeaders sets response headers in a given response writer.
+// Make sure to use it before http.ResponseWriter.WriteHeader and .Write.
+func (s ResponseStats) SetHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set(prw20AcceptedSamplesHeader, strconv.Itoa(s.AcceptedSamples))
+	h.Set(rw20AcceptedHistogramsHeader, strconv.Itoa(s.AcceptedHistograms))
+	h.Set(rw20AcceptedExemplarsHeader, strconv.Itoa(s.AcceptedExemplars))
+}
+
+// ParseV2ResponseStats returns ResponseStats parsed from response headers.
+// Missing header means 0 (or we reached PRW 1.0 Receiver).
+// Error is returned when any of the header fails to parse as int64, but the
+// resulted ResponseStats remains valid to use.
+func ParseV2ResponseStats(r *http.Response) (rs ResponseStats, err error) {
+	var (
+		errs []error
+		h    = r.Header
+	)
+	if v := h.Get(prw20AcceptedSamplesHeader); v != "" { // Empty means zero.
+		if rs.AcceptedSamples, err = strconv.Atoi(v); err != nil {
+			rs.AcceptedSamples = 0
+			errs = append(errs, err)
+		}
+	}
+	if v := h.Get(rw20AcceptedHistogramsHeader); v != "" { // Empty means zero.
+		if rs.AcceptedHistograms, err = strconv.Atoi(v); err != nil {
+			rs.AcceptedHistograms = 0
+			errs = append(errs, err)
+		}
+	}
+	if v := h.Get(rw20AcceptedExemplarsHeader); v != "" { // Empty means zero.
+		if rs.AcceptedExemplars, err = strconv.Atoi(v); err != nil {
+			rs.AcceptedExemplars = 0
+			errs = append(errs, err)
+		}
+	}
+	return rs, errors.Join(errs...)
 }
 
 // writeV2 is similar to write, but it works with v2 proto message,
@@ -345,13 +393,13 @@ func (s responseStats) SetResponseHeaders(h http.Header) {
 //
 // NOTE(bwplotka): TSDB storage is NOT idempotent, so we don't allow "partial retry-able" errors.
 // Once we have 5xx type of error, we immediately stop and rollback all appends.
-func (h *writeHandler) writeV2(ctx context.Context, req *writev2.Request) (_ responseStats, errHTTPCode int, _ error) {
+func (h *writeHandler) writeV2(ctx context.Context, req *writev2.Request) (_ ResponseStats, errHTTPCode int, _ error) {
 	app := &timeLimitAppender{
 		Appender: h.appendable.Appender(ctx),
 		maxTime:  timestamp.FromTime(time.Now().Add(maxAheadTime)),
 	}
 
-	rs := responseStats{}
+	rs := ResponseStats{}
 	samplesWithoutMetadata, errHTTPCode, err := h.appendV2(app, req, &rs)
 	if err != nil {
 		if errHTTPCode/5 == 100 {
@@ -360,14 +408,14 @@ func (h *writeHandler) writeV2(ctx context.Context, req *writev2.Request) (_ res
 			if rerr := app.Rollback(); rerr != nil {
 				level.Error(h.logger).Log("msg", "writev2 rollback failed on retry-able error", "err", rerr)
 			}
-			return responseStats{}, errHTTPCode, err
+			return ResponseStats{}, errHTTPCode, err
 		}
 
 		// Non-retriable (e.g. bad request error case). Can be partially written.
 		commitErr := app.Commit()
 		if commitErr != nil {
 			// Bad requests does not matter as we have internal error (retryable).
-			return responseStats{}, http.StatusInternalServerError, commitErr
+			return ResponseStats{}, http.StatusInternalServerError, commitErr
 		}
 		// Bad request error happened, but rest of data (if any) was written.
 		h.samplesAppendedWithoutMetadata.Add(float64(samplesWithoutMetadata))
@@ -376,13 +424,13 @@ func (h *writeHandler) writeV2(ctx context.Context, req *writev2.Request) (_ res
 
 	// All good just commit.
 	if err := app.Commit(); err != nil {
-		return responseStats{}, http.StatusInternalServerError, err
+		return ResponseStats{}, http.StatusInternalServerError, err
 	}
 	h.samplesAppendedWithoutMetadata.Add(float64(samplesWithoutMetadata))
 	return rs, 0, nil
 }
 
-func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *responseStats) (samplesWithoutMetadata, errHTTPCode int, err error) {
+func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *ResponseStats) (samplesWithoutMetadata, errHTTPCode int, err error) {
 	var (
 		badRequestErrs                                   []error
 		outOfOrderExemplarErrs, samplesWithInvalidLabels int
@@ -400,14 +448,14 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 			continue
 		}
 
-		allSamplesSoFar := rs.samples + rs.histograms
+		allSamplesSoFar := rs.AllAcceptedSamples()
 		var ref storage.SeriesRef
 
 		// Samples.
 		for _, s := range ts.Samples {
 			ref, err = app.Append(ref, ls, s.GetTimestamp(), s.GetValue())
 			if err == nil {
-				rs.samples++
+				rs.AcceptedSamples++
 				continue
 			}
 			// Handle append error.
@@ -431,7 +479,7 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 				ref, err = app.AppendHistogram(ref, ls, hp.Timestamp, hp.ToIntHistogram(), nil)
 			}
 			if err == nil {
-				rs.histograms++
+				rs.AcceptedHistograms++
 				continue
 			}
 			// Handle append error.
@@ -453,7 +501,7 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 			e := ep.ToExemplar(&b, req.Symbols)
 			ref, err = app.AppendExemplar(ref, ls, e)
 			if err == nil {
-				rs.exemplars++
+				rs.AcceptedExemplars++
 				continue
 			}
 			// Handle append error.
@@ -472,7 +520,7 @@ func (h *writeHandler) appendV2(app storage.Appender, req *writev2.Request, rs *
 			level.Debug(h.logger).Log("msg", "error while updating metadata from remote write", "err", err)
 			// Metadata is attached to each series, so since Prometheus does not reject sample without metadata information,
 			// we don't report remote write error either. We increment metric instead.
-			samplesWithoutMetadata += (rs.samples + rs.histograms) - allSamplesSoFar
+			samplesWithoutMetadata += rs.AllAcceptedSamples() - allSamplesSoFar
 		}
 	}
 

@@ -391,7 +391,7 @@ func (m *queueManagerMetrics) unregister() {
 // external timeseries database.
 type WriteClient interface {
 	// Store stores the given samples in the remote storage.
-	Store(ctx context.Context, req []byte, retryAttempt int) error
+	Store(ctx context.Context, req []byte, retryAttempt int) (ResponseStats, error)
 	// Name uniquely identifies the remote storage.
 	Name() string
 	// Endpoint is the remote read or write endpoint for the storage client.
@@ -597,14 +597,15 @@ func (t *QueueManager) sendMetadataWithBackoff(ctx context.Context, metadata []p
 		}
 
 		begin := time.Now()
-		err := t.storeClient.Store(ctx, req, try)
+		// Ignoring ResponseStats, because there is nothing for metadata, since it's
+		// embedded in v2 calls now, and we do v1 here.
+		_, err := t.storeClient.Store(ctx, req, try)
 		t.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
 
 		if err != nil {
 			span.RecordError(err)
 			return err
 		}
-
 		return nil
 	}
 
@@ -1661,8 +1662,8 @@ func populateTimeSeries(batch []timeSeries, pendingData []prompb.TimeSeries, sen
 
 func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount int, pBuf *proto.Buffer, buf *[]byte, enc Compression) error {
 	begin := time.Now()
-	err := s.sendSamplesWithBackoff(ctx, samples, sampleCount, exemplarCount, histogramCount, 0, pBuf, buf, enc)
-	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, 0, time.Since(begin))
+	rs, err := s.sendSamplesWithBackoff(ctx, samples, sampleCount, exemplarCount, histogramCount, 0, pBuf, buf, enc)
+	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, 0, rs, time.Since(begin))
 	return err
 }
 
@@ -1670,24 +1671,26 @@ func (s *shards) sendSamples(ctx context.Context, samples []prompb.TimeSeries, s
 // See https://github.com/prometheus/prometheus/issues/14409
 func (s *shards) sendV2Samples(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, enc Compression) error {
 	begin := time.Now()
-	err := s.sendV2SamplesWithBackoff(ctx, samples, labels, sampleCount, exemplarCount, histogramCount, metadataCount, pBuf, buf, enc)
-	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, time.Since(begin))
+	rs, err := s.sendV2SamplesWithBackoff(ctx, samples, labels, sampleCount, exemplarCount, histogramCount, metadataCount, pBuf, buf, enc)
+	s.updateMetrics(ctx, err, sampleCount, exemplarCount, histogramCount, metadataCount, rs, time.Since(begin))
 	return err
 }
 
-func (s *shards) updateMetrics(_ context.Context, err error, sampleCount, exemplarCount, histogramCount, metadataCount int, duration time.Duration) {
+func (s *shards) updateMetrics(_ context.Context, err error, sampleCount, exemplarCount, histogramCount, metadataCount int, rs ResponseStats, duration time.Duration) {
 	if err != nil {
-		level.Error(s.qm.logger).Log("msg", "non-recoverable error", "count", sampleCount, "exemplarCount", exemplarCount, "histogramCount", histogramCount, "err", err)
-		s.qm.metrics.failedSamplesTotal.Add(float64(sampleCount))
-		s.qm.metrics.failedExemplarsTotal.Add(float64(exemplarCount))
-		s.qm.metrics.failedHistogramsTotal.Add(float64(histogramCount))
+		level.Error(s.qm.logger).Log("msg", "non-recoverable error", "failedSampleCount", sampleCount-rs.AcceptedSamples, "failedHistogramCount", histogramCount-rs.AcceptedHistograms, "failedExemplarCount", exemplarCount-rs.AcceptedExemplars, "err", err)
+		s.qm.metrics.failedSamplesTotal.Add(float64(sampleCount - rs.AcceptedSamples))
+		s.qm.metrics.failedHistogramsTotal.Add(float64(histogramCount - rs.AcceptedHistograms))
 	}
+	// Exemplars are a best effort in PRW 2.0 and 1.0, so might fail despite 2xx status code, account for that.
+	s.qm.metrics.failedExemplarsTotal.Add(float64(exemplarCount - rs.AcceptedExemplars))
 
 	// These counters are used to calculate the dynamic sharding, and as such
 	// should be maintained irrespective of success or failure.
 	s.qm.dataOut.incr(int64(sampleCount + exemplarCount + histogramCount + metadataCount))
 	s.qm.dataOutDuration.incr(int64(duration))
 	s.qm.lastSendTimestamp.Store(time.Now().Unix())
+
 	// Pending samples/exemplars/histograms also should be subtracted, as an error means
 	// they will not be retried.
 	s.qm.metrics.pendingSamples.Sub(float64(sampleCount))
@@ -1699,18 +1702,26 @@ func (s *shards) updateMetrics(_ context.Context, err error, sampleCount, exempl
 }
 
 // sendSamples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *proto.Buffer, buf *[]byte, enc Compression) error {
+func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.TimeSeries, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf *proto.Buffer, buf *[]byte, enc Compression) (ResponseStats, error) {
 	// Build the WriteRequest with no metadata.
 	req, highest, lowest, err := buildWriteRequest(s.qm.logger, samples, nil, pBuf, buf, nil, enc)
 	s.qm.buildRequestLimitTimestamp.Store(lowest)
 	if err != nil {
 		// Failing to build the write request is non-recoverable, since it will
 		// only error if marshaling the proto to bytes fails.
-		return err
+		return ResponseStats{}, err
 	}
 
 	reqSize := len(req)
 	*buf = req
+
+	totalRs := ResponseStats{}
+	var totalRsMu sync.Mutex
+	addStats := func(rs ResponseStats) {
+		totalRsMu.Lock()
+		totalRs = totalRs.Add(rs)
+		totalRsMu.Unlock()
+	}
 
 	// An anonymous function allows us to defer the completion of our per-try spans
 	// without causing a memory leak, and it has the nice effect of not propagating any
@@ -1759,15 +1770,19 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
 		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
 		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
-		err := s.qm.client().Store(ctx, *buf, try)
+		// Technically for v1, we will likely have empty response stats, but for
+		// newer Receivers this might be not, so used it in a best effort.
+		rs, err := s.qm.client().Store(ctx, *buf, try)
 		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
+		// TODO(bwplotka): Revisit this once we have Receivers doing retriable partial error
+		// so far we don't have those, so it's ok to potentially skew statistics.
+		addStats(rs)
 
-		if err != nil {
-			span.RecordError(err)
-			return err
+		if err == nil {
+			return nil
 		}
-
-		return nil
+		span.RecordError(err)
+		return err
 	}
 
 	onRetry := func() {
@@ -1780,28 +1795,45 @@ func (s *shards) sendSamplesWithBackoff(ctx context.Context, samples []prompb.Ti
 	if errors.Is(err, context.Canceled) {
 		// When there is resharding, we cancel the context for this queue, which means the data is not sent.
 		// So we exit early to not update the metrics.
-		return err
+		return totalRs, err
 	}
 
 	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
 	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
-
-	return err
+	if err == nil {
+		if (sampleCount > 0 && totalRs.AcceptedSamples == 0) || (histogramCount > 0 && totalRs.AcceptedHistograms == 0) || (exemplarCount > 0 && totalRs.AcceptedExemplars == 0) {
+			// Likely we hit 1.0 Receiver, 1.0 didn't support statistics, we have to assume success.
+			return ResponseStats{
+				AcceptedSamples:    sampleCount,
+				AcceptedHistograms: histogramCount,
+				AcceptedExemplars:  exemplarCount,
+			}, nil
+		}
+	}
+	return totalRs, err
 }
 
 // sendV2Samples to the remote storage with backoff for recoverable errors.
-func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, enc Compression) error {
+func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2.TimeSeries, labels []string, sampleCount, exemplarCount, histogramCount, metadataCount int, pBuf, buf *[]byte, enc Compression) (ResponseStats, error) {
 	// Build the WriteRequest with no metadata.
 	req, highest, lowest, err := buildV2WriteRequest(s.qm.logger, samples, labels, pBuf, buf, nil, enc)
 	s.qm.buildRequestLimitTimestamp.Store(lowest)
 	if err != nil {
 		// Failing to build the write request is non-recoverable, since it will
 		// only error if marshaling the proto to bytes fails.
-		return err
+		return ResponseStats{}, err
 	}
 
 	reqSize := len(req)
 	*buf = req
+
+	totalRs := ResponseStats{}
+	var totalRsMu sync.Mutex
+	addStats := func(rs ResponseStats) {
+		totalRsMu.Lock()
+		totalRs = totalRs.Add(rs)
+		totalRsMu.Unlock()
+	}
 
 	// An anonymous function allows us to defer the completion of our per-try spans
 	// without causing a memory leak, and it has the nice effect of not propagating any
@@ -1850,15 +1882,25 @@ func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2
 		s.qm.metrics.exemplarsTotal.Add(float64(exemplarCount))
 		s.qm.metrics.histogramsTotal.Add(float64(histogramCount))
 		s.qm.metrics.metadataTotal.Add(float64(metadataCount))
-		err := s.qm.client().Store(ctx, *buf, try)
+		rs, err := s.qm.client().Store(ctx, *buf, try)
 		s.qm.metrics.sentBatchDuration.Observe(time.Since(begin).Seconds())
+		// TODO(bwplotka): Revisit this once we have Receivers doing retriable partial error
+		// so far we don't have those, so it's ok to potentially skew statistics.
+		addStats(rs)
 
-		if err != nil {
-			span.RecordError(err)
-			return err
+		if err == nil {
+			// Check the case mentioned in PRW 2.0 https://github.com/prometheus/docs/pull/2486
+			// We don't check exemplars as they are might be skipped without returning 400.
+			if (sampleCount > 0 && rs.AcceptedSamples == 0) || (histogramCount > 0 && rs.AcceptedHistograms == 0) {
+				err = fmt.Errorf("sent v2 request with %v samples and %v histograms; got 2xx, but PRW 2.0 response header statistics indicate %v samples and %v histograms were accepted;"+
+					" assumining failure e.g. the target only supports PRW 1.0 prometheus.WriteRequest, but does not check the Content-Type header correctly", sampleCount, histogramCount, rs.AcceptedSamples, rs.AcceptedHistograms)
+				span.RecordError(err)
+				return err
+			}
+			return nil
 		}
-
-		return nil
+		span.RecordError(err)
+		return err
 	}
 
 	onRetry := func() {
@@ -1871,13 +1913,12 @@ func (s *shards) sendV2SamplesWithBackoff(ctx context.Context, samples []writev2
 	if errors.Is(err, context.Canceled) {
 		// When there is resharding, we cancel the context for this queue, which means the data is not sent.
 		// So we exit early to not update the metrics.
-		return err
+		return totalRs, err
 	}
 
 	s.qm.metrics.sentBytesTotal.Add(float64(reqSize))
 	s.qm.metrics.highestSentTimestamp.Set(float64(highest / 1000))
-
-	return err
+	return totalRs, err
 }
 
 func populateV2TimeSeries(symbolTable *writev2.SymbolsTable, batch []timeSeries, pendingData []writev2.TimeSeries, sendExemplars, sendNativeHistograms bool) (int, int, int, int) {
